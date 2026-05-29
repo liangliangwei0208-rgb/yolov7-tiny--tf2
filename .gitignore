@@ -6,8 +6,8 @@ datasets/
 Medical_Datasets/
 lfw/
 logs/
-model_data/
 .temp_map_out/
+.vscode/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
