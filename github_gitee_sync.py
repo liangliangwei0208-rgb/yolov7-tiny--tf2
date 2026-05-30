@@ -208,6 +208,18 @@ def ensure_has_commit(repo: Path) -> None:
         )
 
 
+def is_shallow_repository(repo: Path) -> bool:
+    return git_output(repo, ["rev-parse", "--is-shallow-repository"]) == "true"
+
+
+def ensure_complete_history(repo: Path, remote: str, *, dry_run: bool) -> None:
+    if not is_shallow_repository(repo):
+        return
+
+    step(f"Complete shallow Git history from {remote}")
+    run_git(repo, ["fetch", "--unshallow", remote], dry_run=dry_run)
+
+
 def get_remote_url(repo: Path, remote: str) -> str | None:
     result = subprocess.run(
         ["git", "remote", "get-url", remote],
@@ -1115,6 +1127,8 @@ def sync_repositories(
     if not fetched_remotes and fetch_warnings:
         raise SyncError("Both GitHub and Gitee fetch operations failed.")
 
+    ensure_complete_history(repo, github_remote, dry_run=dry_run)
+
     try:
         for remote in fetched_remotes:
             # 5. 把远程新提交合并进本地。冲突需要用户手动解决后再重跑脚本。
@@ -1147,6 +1161,18 @@ def sync_repositories(
     gitee_push_failed = any(
         failure.startswith(f"push {gitee_remote}:") for failure in push_failures
     )
+    if push_failures:
+        if gitee_public_after_push and gitee_push_failed:
+            log(
+                "[WARN] Skipping public visibility retry because the Gitee push failed. "
+                "Fix the push failure and re-run."
+            )
+        for warning in fetch_warnings:
+            log(f"[WARN] {warning}")
+        for failure in push_failures:
+            log(f"[ERROR] {failure}")
+        raise SyncError("At least one push failed. Re-run after fixing remote access.")
+
     if gitee_public_after_push and not gitee_push_failed:
         step("Retry making Gitee repository public after initial push")
         response = get_gitee_repo(target, token)
@@ -1167,11 +1193,6 @@ def sync_repositories(
                 "Check whether the Gitee push created the target branch, then re-run."
             )
         ensure_gitee_repo_visibility(target, response, private=private)
-    elif gitee_public_after_push:
-        log(
-            "[WARN] Skipping public visibility retry because the Gitee push failed. "
-            "Fix the push failure and re-run."
-        )
 
     ensure_gitee_default_branch(
         target=target,
@@ -1185,10 +1206,6 @@ def sync_repositories(
         log(f"[WARN] Initialized missing remote branch during push: {missing_ref}")
     for warning in fetch_warnings:
         log(f"[WARN] {warning}")
-    if push_failures:
-        for failure in push_failures:
-            log(f"[ERROR] {failure}")
-        raise SyncError("At least one push failed. Re-run after fixing remote access.")
     log("Sync complete: local, GitHub, and Gitee are aligned.")
 
 
