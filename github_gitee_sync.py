@@ -486,7 +486,7 @@ def github_token() -> tuple[str | None, str]:
         return token, source
 
     return None, GITHUB_TOKEN_ENV_NAMES[0]
-2
+
 
 def ensure_https_support() -> None:
     """检查当前 Python 是否能使用 HTTPS；conda 环境未激活时常在这里失败。"""
