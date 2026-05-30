@@ -789,6 +789,28 @@ def ensure_gitee_repo_visibility(
         )
 
 
+def make_gitee_repo_public_if_needed(
+    target: GiteeTarget,
+    response: ApiResponse,
+    *,
+    token: str | None,
+    private: bool,
+) -> ApiResponse:
+    if private or not is_gitee_repo_private(response):
+        return response
+
+    if not token:
+        raise SyncError(
+            f"Gitee repository already exists but is private: {target.web_url}. "
+            f"Set {GITEE_TOKEN_ENV} so the script can make it public, "
+            "or make it public on Gitee manually."
+        )
+
+    step(f"Make Gitee repository public: {target.web_url}")
+    update_gitee_repo_visibility(target, token=token, private=False)
+    return get_gitee_repo(target, token)
+
+
 def update_gitee_repo_visibility(
     target: GiteeTarget,
     *,
@@ -917,16 +939,12 @@ def ensure_gitee_repo(
     step(f"Check Gitee repository: {target.web_url}")
     response = get_gitee_repo(target, token)
     if response.status == 200:
-        if not private and is_gitee_repo_private(response):
-            if not token:
-                raise SyncError(
-                    f"Gitee repository already exists but is private: {target.web_url}. "
-                    f"Set {GITEE_TOKEN_ENV} so the script can make it public, "
-                    "or make it public on Gitee manually."
-                )
-            step(f"Make existing Gitee repository public: {target.web_url}")
-            update_gitee_repo_visibility(target, token=token, private=False)
-            response = get_gitee_repo(target, token)
+        response = make_gitee_repo_public_if_needed(
+            target,
+            response,
+            token=token,
+            private=private,
+        )
         ensure_gitee_repo_visibility(target, response, private=private)
         log(f"Gitee repository exists: {target.web_url}")
         return
@@ -950,6 +968,12 @@ def ensure_gitee_repo(
             "Gitee repository was created, but the expected target path was not found. "
             "Check whether --gitee-owner matches your Gitee account namespace."
         )
+    response = make_gitee_repo_public_if_needed(
+        target,
+        response,
+        token=token,
+        private=private,
+    )
     ensure_gitee_repo_visibility(target, response, private=private)
     log(f"Gitee repository created: {target.web_url}")
 
