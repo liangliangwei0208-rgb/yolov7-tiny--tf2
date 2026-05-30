@@ -46,7 +46,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 
-DEFAULT_BRANCH = "main"
+DEFAULT_BRANCH = None
 DEFAULT_GITHUB_REMOTE = "origin"
 DEFAULT_GITEE_REMOTE = "gitee"
 DEFAULT_GITHUB_OWNER = "liangliangwei0208-rgb"
@@ -174,6 +174,13 @@ def ensure_current_branch(repo: Path, branch: str) -> None:
     current = git_output(repo, ["branch", "--show-current"])
     if current != branch:
         raise SyncError(f"Current branch is {current!r}; expected {branch!r}.")
+
+
+def current_branch(repo: Path) -> str:
+    branch = git_output(repo, ["branch", "--show-current"])
+    if not branch:
+        raise SyncError("Could not detect current branch. Check whether HEAD is detached.")
+    return branch
 
 
 def ensure_clean_worktree(repo: Path) -> None:
@@ -820,7 +827,7 @@ def update_gitee_default_branch(
     token: str,
     branch: str,
 ) -> None:
-    # Gitee 网页默认展示 default_branch；同步 main 后也要把默认分支切到 main。
+    # Gitee 网页默认展示 default_branch；同步后也要把默认分支切到当前同步分支。
     response = gitee_api_request(
         "PATCH",
         f"/repos/{api_quote(target.owner)}/{api_quote(target.name)}",
@@ -974,7 +981,7 @@ def print_final_refs(repo: Path, branch: str, github_remote: str, gitee_remote: 
 def sync_repositories(
     *,
     repo: Path,
-    branch: str,
+    branch: str | None,
     github_remote: str,
     gitee_remote: str,
     github_owner: str | None,
@@ -986,6 +993,8 @@ def sync_repositories(
     dry_run: bool,
 ) -> None:
     repo = ensure_repo(repo)
+    if branch is None:
+        branch = current_branch(repo)
     log(f"Repository: {repo}")
     log(f"Branch: {branch}")
     log(f"GitHub remote: {github_remote}")
@@ -1041,7 +1050,7 @@ def sync_repositories(
     missing_refs: list[str] = []
     fetched_remotes: list[str] = []
     for remote in (github_remote, gitee_remote):
-        # 4. 拉取两端远程分支。新仓库还没有 main 分支时，只记录 warning。
+        # 4. 拉取两端远程分支。新仓库还没有该分支时，只记录 warning。
         step(f"Fetch {remote}/{branch}")
         result = run_git(repo, ["fetch", remote, branch], check=False)
         if result.returncode == 0:
@@ -1209,7 +1218,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--branch",
         default=DEFAULT_BRANCH,
-        help=f"Branch to synchronize. Defaults to {DEFAULT_BRANCH}.",
+        help="Branch to synchronize. Defaults to the current branch.",
     )
     parser.add_argument(
         "--github-remote",
@@ -1282,7 +1291,7 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         sync_repositories(
             repo=repo,
-            branch=str(args.branch),
+            branch=args.branch,
             github_remote=str(args.github_remote),
             gitee_remote=str(args.gitee_remote),
             github_owner=args.github_owner,
