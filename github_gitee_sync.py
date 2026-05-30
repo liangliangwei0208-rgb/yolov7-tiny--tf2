@@ -212,12 +212,68 @@ def is_shallow_repository(repo: Path) -> bool:
     return git_output(repo, ["rev-parse", "--is-shallow-repository"]) == "true"
 
 
+def git_dir(repo: Path) -> Path:
+    path = Path(git_output(repo, ["rev-parse", "--git-dir"]))
+    if not path.is_absolute():
+        path = repo / path
+    return path.resolve()
+
+
+def is_commit_reachable_from_refs(repo: Path, commit: str) -> bool:
+    result = subprocess.run(
+        ["git", "name-rev", "--name-only", "--no-undefined", commit],
+        cwd=str(repo),
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        capture_output=True,
+        check=False,
+    )
+    return result.returncode == 0
+
+
+def prune_stale_shallow_markers(repo: Path, *, dry_run: bool) -> None:
+    shallow_file = git_dir(repo) / "shallow"
+    if not shallow_file.exists():
+        return
+
+    markers = [
+        line.strip()
+        for line in shallow_file.read_text(encoding="utf-8", errors="replace").splitlines()
+        if line.strip()
+    ]
+    stale_markers = [
+        marker for marker in markers if not is_commit_reachable_from_refs(repo, marker)
+    ]
+    if not stale_markers:
+        return
+
+    stale_marker_set = set(stale_markers)
+    kept_markers = [marker for marker in markers if marker not in stale_marker_set]
+    if kept_markers:
+        step(f"Remove stale shallow marker entries: {len(stale_markers)}")
+        if not dry_run:
+            shallow_file.write_text("\n".join(kept_markers) + "\n", encoding="utf-8")
+        return
+
+    step("Remove stale shallow marker file")
+    if not dry_run:
+        shallow_file.unlink()
+
+
 def ensure_complete_history(repo: Path, remote: str, *, dry_run: bool) -> None:
+    prune_stale_shallow_markers(repo, dry_run=dry_run)
     if not is_shallow_repository(repo):
         return
 
     step(f"Complete shallow Git history from {remote}")
     run_git(repo, ["fetch", "--unshallow", remote], dry_run=dry_run)
+    prune_stale_shallow_markers(repo, dry_run=dry_run)
+    if not dry_run and is_shallow_repository(repo):
+        raise SyncError(
+            "Repository is still shallow after fetching full history. "
+            "Check .git/shallow before pushing to mirrors."
+        )
 
 
 def get_remote_url(repo: Path, remote: str) -> str | None:
