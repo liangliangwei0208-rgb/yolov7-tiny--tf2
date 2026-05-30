@@ -9,7 +9,8 @@
 3. [快速预测](#快速预测)
 4. [训练自己的数据集](#训练自己的数据集)
 5. [评估模型](#评估模型)
-6. [常见注意事项](#常见注意事项)
+6. [GitHub/Gitee 三方同步](#githubgitee-三方同步)
+7. [常见注意事项](#常见注意事项)
 
 ## 项目结构
 
@@ -134,6 +135,64 @@ python get_map.py
 ```
 
 评估结果会输出到 `map_out/`，该目录默认不提交到远程库。
+
+## GitHub/Gitee 三方同步
+
+同步脚本是 `github_gitee_sync.py`，用于补齐 GitHub 仓库并把本地、GitHub、Gitee 三端同步到同一分支。
+
+推荐直接运行菜单：
+
+```bash
+python github_gitee_sync.py
+```
+
+菜单功能：
+
+- `1`：创建/补齐 GitHub 公开仓库。当前目录必须已经是本地 Git 仓库；如果缺少 GitHub `origin`，脚本会按当前文件夹名创建公开 GitHub 仓库并添加远端。
+- 如果 GitHub 网页仓库已经删除，但本地 `origin` 仍保留旧地址，菜单功能 `1` 会提示是否改成当前文件夹名对应的新公开库。
+- `2`：三方同步本地、GitHub、Gitee。同步前要求工作区干净，脚本不会自动提交未提交改动。
+- `0`：退出。
+
+如果要在非交互环境中运行，可以直接指定功能：
+
+```bash
+python github_gitee_sync.py --ensure-github
+python github_gitee_sync.py --sync
+```
+
+首次自动创建 GitHub 仓库前，推荐先登录 GitHub CLI：
+
+```powershell
+gh auth login
+```
+
+如果已经登录，脚本会自动复用 `gh auth token`，不需要手动设置环境变量。也可以手动设置 GitHub token：
+
+```powershell
+$env:GITHUB_TOKEN="your-github-token"
+```
+
+如果要自动创建或检查 Gitee 仓库，还需要设置：
+
+```powershell
+$env:GITEE_ACCESS_TOKEN="your-gitee-token"
+```
+
+常用检查命令：
+
+```bash
+python github_gitee_sync.py --dry-run --ensure-github
+python github_gitee_sync.py --dry-run --sync
+```
+
+注意事项：
+
+- GitHub 仓库默认公开，名称默认严格使用当前文件夹名；只有传 `--github-private` 才创建私有库。
+- 如果已有 `origin` 但不是 GitHub 地址，脚本默认停止；确认要改远端时再传 `--fix-remote`。
+- 非交互运行 `--ensure-github` 时，如果旧 GitHub 仓库已删除且仓库名不同，默认仍会停止；确认要直接替换远端时追加 `--fix-remote`。
+- 三方同步时，Gitee 仓库名会跟随最终 GitHub 仓库名；如果本地 `gitee` 远端还是旧仓库名，脚本会自动改成同名目标。
+- 如果同步时提示工作区不干净，请先手动检查并提交或暂存改动，再重新运行同步。
+- 如果发生合并冲突，请手动解决冲突、提交后再重新运行 `python github_gitee_sync.py --sync`。
 
 ## 常见注意事项
 
