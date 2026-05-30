@@ -743,6 +743,11 @@ def gitee_error_message(response: ApiResponse) -> str:
     return response.text.strip() or f"HTTP {response.status}"
 
 
+def is_empty_gitee_repo_public_error(response: ApiResponse) -> bool:
+    message = gitee_error_message(response)
+    return response.status == 422 and "空仓库不支持设置为公开仓库" in message
+
+
 def get_gitee_repo(target: GiteeTarget, token: str | None) -> ApiResponse:
     # 查询 Gitee 仓库是否存在；公开仓库通常不用 token 也能查到。
     return gitee_api_request(
@@ -795,9 +800,9 @@ def make_gitee_repo_public_if_needed(
     *,
     token: str | None,
     private: bool,
-) -> ApiResponse:
+) -> tuple[ApiResponse, bool]:
     if private or not is_gitee_repo_private(response):
-        return response
+        return response, False
 
     if not token:
         raise SyncError(
@@ -807,8 +812,18 @@ def make_gitee_repo_public_if_needed(
         )
 
     step(f"Make Gitee repository public: {target.web_url}")
-    update_gitee_repo_visibility(target, token=token, private=False)
-    return get_gitee_repo(target, token)
+    if not update_gitee_repo_visibility(
+        target,
+        token=token,
+        private=False,
+        allow_empty_repo=True,
+    ):
+        log(
+            "[WARN] Gitee does not allow making an empty repository public yet; "
+            "will retry after pushing code."
+        )
+        return response, True
+    return get_gitee_repo(target, token), False
 
 
 def update_gitee_repo_visibility(
@@ -816,7 +831,8 @@ def update_gitee_repo_visibility(
     *,
     token: str,
     private: bool,
-) -> None:
+    allow_empty_repo: bool = False,
+) -> bool:
     # Gitee 使用 PATCH 仓库接口更新公开/私有状态，private=false 表示公开仓库。
     response = gitee_api_request(
         "PATCH",
@@ -828,10 +844,13 @@ def update_gitee_repo_visibility(
         },
     )
     if response.status not in (200, 201, 204):
+        if not private and allow_empty_repo and is_empty_gitee_repo_public_error(response):
+            return False
         raise SyncError(
             f"Could not update Gitee repository visibility {target.web_url}: "
             f"HTTP {response.status}: {gitee_error_message(response)}"
         )
+    return True
 
 
 def gitee_default_branch(response: ApiResponse) -> str | None:
@@ -930,24 +949,25 @@ def ensure_gitee_repo(
     token: str | None,
     private: bool,
     dry_run: bool,
-) -> None:
+) -> bool:
     visibility = "private" if private else "public"
     if dry_run:
         step(f"Would check or create {visibility} Gitee repository: {target.web_url}")
-        return
+        return False
 
     step(f"Check Gitee repository: {target.web_url}")
     response = get_gitee_repo(target, token)
     if response.status == 200:
-        response = make_gitee_repo_public_if_needed(
+        response, retry_public_after_push = make_gitee_repo_public_if_needed(
             target,
             response,
             token=token,
             private=private,
         )
-        ensure_gitee_repo_visibility(target, response, private=private)
+        if not retry_public_after_push:
+            ensure_gitee_repo_visibility(target, response, private=private)
         log(f"Gitee repository exists: {target.web_url}")
-        return
+        return retry_public_after_push
     if response.status != 404:
         raise SyncError(
             f"Could not check Gitee repository {target.web_url}: "
@@ -968,14 +988,16 @@ def ensure_gitee_repo(
             "Gitee repository was created, but the expected target path was not found. "
             "Check whether --gitee-owner matches your Gitee account namespace."
         )
-    response = make_gitee_repo_public_if_needed(
+    response, retry_public_after_push = make_gitee_repo_public_if_needed(
         target,
         response,
         token=token,
         private=private,
     )
-    ensure_gitee_repo_visibility(target, response, private=private)
+    if not retry_public_after_push:
+        ensure_gitee_repo_visibility(target, response, private=private)
     log(f"Gitee repository created: {target.web_url}")
+    return retry_public_after_push
 
 
 def remote_ref(remote: str, branch: str) -> str:
@@ -1050,7 +1072,12 @@ def sync_repositories(
 
     # 3. 确保 Gitee 仓库存在。默认创建公开仓库；只有传 --private 才创建/允许私有仓库。
     token = os.environ.get(GITEE_TOKEN_ENV)
-    ensure_gitee_repo(target=target, token=token, private=private, dry_run=dry_run)
+    gitee_public_after_push = ensure_gitee_repo(
+        target=target,
+        token=token,
+        private=private,
+        dry_run=dry_run,
+    )
     ensure_gitee_remote(
         repo=repo,
         remote=gitee_remote,
@@ -1116,6 +1143,35 @@ def sync_repositories(
         result = run_git(repo, ["fetch", remote, branch], check=False)
         if result.returncode != 0:
             fetch_warnings.append(f"refresh {remote}: exit code {result.returncode}")
+
+    gitee_push_failed = any(
+        failure.startswith(f"push {gitee_remote}:") for failure in push_failures
+    )
+    if gitee_public_after_push and not gitee_push_failed:
+        step("Retry making Gitee repository public after initial push")
+        response = get_gitee_repo(target, token)
+        if response.status != 200:
+            raise SyncError(
+                f"Could not read Gitee repository visibility {target.web_url}: "
+                f"HTTP {response.status}: {gitee_error_message(response)}"
+            )
+        response, still_empty = make_gitee_repo_public_if_needed(
+            target,
+            response,
+            token=token,
+            private=private,
+        )
+        if still_empty:
+            raise SyncError(
+                "Gitee still reports the repository as empty after push. "
+                "Check whether the Gitee push created the target branch, then re-run."
+            )
+        ensure_gitee_repo_visibility(target, response, private=private)
+    elif gitee_public_after_push:
+        log(
+            "[WARN] Skipping public visibility retry because the Gitee push failed. "
+            "Fix the push failure and re-run."
+        )
 
     ensure_gitee_default_branch(
         target=target,
