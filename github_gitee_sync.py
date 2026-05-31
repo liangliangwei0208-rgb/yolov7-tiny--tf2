@@ -52,6 +52,7 @@ DEFAULT_BRANCH = None
 DEFAULT_GITHUB_REMOTE = "origin"
 DEFAULT_GITEE_REMOTE = "gitee"
 DEFAULT_GITHUB_OWNER = "liangliangwei0208-rgb"
+DEFAULT_GITEE_OWNER = "liangliang2000"
 MODE_ENSURE_GITHUB = "ensure-github"
 MODE_SYNC = "sync"
 MODE_EXIT = "exit"
@@ -91,6 +92,7 @@ class GiteeTarget:
     owner: str
     name: str
     ssh_url: str
+    https_url: str
     web_url: str
 
 
@@ -384,15 +386,62 @@ def build_gitee_target(owner: str, repo_name: str) -> GiteeTarget:
         owner=owner,
         name=repo_name,
         ssh_url=f"git@gitee.com:{owner}/{repo_name}.git",
+        https_url=f"https://gitee.com/{owner}/{repo_name}.git",
         web_url=f"https://gitee.com/{owner}/{repo_name}",
     )
 
 
 def remote_matches_target(existing_url: str, target: GiteeTarget) -> bool:
-    if existing_url.strip() == target.ssh_url:
+    existing = existing_url.strip()
+    if existing in {target.ssh_url, target.https_url}:
         return True
     slug = parse_remote_slug(existing_url, "gitee.com")
     return slug == RepoSlug(owner=target.owner, name=target.name)
+
+
+def gitee_ssh_remote_usable(repo: Path, target: GiteeTarget) -> bool:
+    """Return True only when the Gitee SSH remote can be accessed non-interactively."""
+    env = os.environ.copy()
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env["GIT_SSH_COMMAND"] = "ssh -o BatchMode=yes -o ConnectTimeout=15"
+    try:
+        result = subprocess.run(
+            ["git", "ls-remote", target.ssh_url],
+            cwd=str(repo),
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            capture_output=True,
+            check=False,
+            timeout=30,
+            env=env,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        log(f"[WARN] Gitee SSH probe failed; will use HTTPS: {exc}")
+        return False
+
+    if result.returncode == 0:
+        log(f"Gitee SSH remote is usable: {target.ssh_url}")
+        return True
+
+    output = strip_ansi(f"{result.stdout}\n{result.stderr}").strip()
+    if output:
+        first_line = output.splitlines()[0]
+        log(f"[WARN] Gitee SSH remote is not usable; will use HTTPS. Reason: {first_line}")
+    else:
+        log("[WARN] Gitee SSH remote is not usable; will use HTTPS.")
+    return False
+
+
+def choose_gitee_git_url(repo: Path, target: GiteeTarget, *, dry_run: bool) -> str:
+    """Prefer SSH for Gitee; fall back to HTTPS when SSH auth/host verification is unavailable."""
+    if dry_run:
+        log(f"Dry run: prefer Gitee SSH remote, fallback HTTPS if needed: {target.ssh_url}")
+        return target.ssh_url
+    if gitee_ssh_remote_usable(repo, target):
+        return target.ssh_url
+    log(f"Using Gitee HTTPS remote: {target.https_url}")
+    return target.https_url
 
 
 def strip_ansi(text: str) -> str:
@@ -432,8 +481,12 @@ def detect_gitee_ssh_owner() -> str | None:
         return None
 
 
-def choose_gitee_owner(explicit_owner: str | None, fallback_owner: str) -> str:
-    """优先使用命令行参数，其次使用 SSH 账号，最后回退 GitHub owner。"""
+def choose_gitee_owner(
+    explicit_owner: str | None,
+    fallback_owner: str,
+    token: str | None = None,
+) -> str:
+    """优先使用命令行参数，其次使用 SSH 账号，再用 Gitee token，最后使用默认 Gitee owner。"""
     if explicit_owner:
         return explicit_owner
 
@@ -442,7 +495,17 @@ def choose_gitee_owner(explicit_owner: str | None, fallback_owner: str) -> str:
         log(f"Detected Gitee SSH owner: {detected_owner}")
         return detected_owner
 
-    log(f"[WARN] Could not detect Gitee SSH owner; fallback to {fallback_owner}")
+    if token:
+        token_owner = gitee_authenticated_login(token)
+        if token_owner:
+            log(f"Detected Gitee owner from token: {token_owner}")
+            return token_owner
+
+    if DEFAULT_GITEE_OWNER:
+        log(f"[WARN] Could not detect Gitee owner; fallback to {DEFAULT_GITEE_OWNER}")
+        return DEFAULT_GITEE_OWNER
+
+    log(f"[WARN] Could not detect Gitee owner; fallback to {fallback_owner}")
     return fallback_owner
 
 
@@ -486,6 +549,51 @@ def github_token() -> tuple[str | None, str]:
         return token, source
 
     return None, GITHUB_TOKEN_ENV_NAMES[0]
+
+
+def read_windows_user_env(name: str) -> str | None:
+    """读取 Windows 用户级环境变量，解决当前 PowerShell 未刷新环境变量的问题。"""
+    if os.name != "nt":
+        return None
+    try:
+        import winreg
+
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment") as key:
+            value, _ = winreg.QueryValueEx(key, name)
+    except Exception:
+        return None
+
+    value = str(value).strip()
+    return value or None
+
+
+def gitee_token() -> tuple[str | None, str]:
+    """优先读取当前进程环境变量，其次读取 Windows 用户级环境变量。"""
+    token = os.environ.get(GITEE_TOKEN_ENV)
+    if token and token.strip():
+        return token.strip(), GITEE_TOKEN_ENV
+
+    token = read_windows_user_env(GITEE_TOKEN_ENV)
+    if token and token.strip():
+        return token.strip(), f"Windows User env {GITEE_TOKEN_ENV}"
+
+    return None, GITEE_TOKEN_ENV
+
+
+def gitee_authenticated_login(token: str) -> str | None:
+    """用 Gitee token 读取当前 Gitee 账号命名空间；失败时返回 None。"""
+    response = gitee_api_request("GET", "/user", token=token)
+    if response.status != 200 or not isinstance(response.data, dict):
+        return None
+
+    for key in ("login", "path", "username", "name"):
+        value = response.data.get(key)
+        if value:
+            try:
+                return validate_slug_part(str(value), "Gitee token owner")
+            except SyncError:
+                continue
+    return None
 
 
 def ensure_https_support() -> None:
@@ -606,6 +714,24 @@ def github_authenticated_login(token: str) -> str:
 
 
 def github_repo_exists(target: GitHubTarget, token: str | None) -> bool:
+    # 先用 Git 协议检查。公开仓库即使没有 GitHub token，也应能被 ls-remote 看到。
+    for remote_url in (
+        f"https://github.com/{target.owner}/{target.name}.git",
+        target.ssh_url,
+    ):
+        result = subprocess.run(
+            ["git", "ls-remote", "--heads", remote_url],
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            capture_output=True,
+            check=False,
+            timeout=30,
+        )
+        if result.returncode == 0:
+            return True
+
+    # Git 检查失败后，再走 GitHub API。
     response = github_api_request(
         "GET",
         f"/repos/{api_quote(target.owner)}/{api_quote(target.name)}",
@@ -873,28 +999,46 @@ def ensure_gitee_remote(
     auto_fix_remote: bool,
     dry_run: bool,
 ) -> None:
+    preferred_url = choose_gitee_git_url(repo, target, dry_run=dry_run)
     existing_url = get_remote_url(repo, remote)
     if existing_url is None:
-        step(f"Add Gitee remote {remote}: {target.ssh_url}")
-        run_git(repo, ["remote", "add", remote, target.ssh_url], dry_run=dry_run)
+        step(f"Add Gitee remote {remote}: {preferred_url}")
+        run_git(repo, ["remote", "add", remote, preferred_url], dry_run=dry_run)
+        return
+
+    existing = existing_url.strip()
+    if existing == preferred_url:
+        log(f"Gitee remote {remote} already points to {existing_url}")
+        return
+
+    if existing in {target.ssh_url, target.https_url}:
+        message = (
+            f"Gitee remote {remote!r} points to {existing_url!r}; "
+            f"preferred usable URL is {preferred_url!r}."
+        )
+        if not fix_remote and not auto_fix_remote:
+            raise SyncError(message + " Re-run with --fix-remote to update it.")
+        if auto_fix_remote and not fix_remote:
+            log(f"[WARN] {message} 三方同步会自动切换到可用协议。")
+        step(f"Update Gitee remote {remote}: {preferred_url}")
+        run_git(repo, ["remote", "set-url", remote, preferred_url], dry_run=dry_run)
         return
 
     if remote_matches_target(existing_url, target):
-        log(f"Gitee remote {remote} already points to {existing_url}")
+        log(f"Gitee remote {remote} already points to the target repository: {existing_url}")
         return
 
     message = (
         f"Gitee remote {remote!r} points to {existing_url!r}, "
-        f"expected {target.ssh_url!r}."
+        f"expected {target.ssh_url!r} or {target.https_url!r}."
     )
     if not fix_remote and not auto_fix_remote:
         raise SyncError(message + " Re-run with --fix-remote to update it.")
 
     if auto_fix_remote and not fix_remote:
         log(f"[WARN] {message} 三方同步会自动改成 GitHub 同名的 Gitee 目标。")
-    step(f"Update Gitee remote {remote}: {target.ssh_url}")
-    run_git(repo, ["remote", "set-url", remote, target.ssh_url], dry_run=dry_run)
-
+    step(f"Update Gitee remote {remote}: {preferred_url}")
+    run_git(repo, ["remote", "set-url", remote, preferred_url], dry_run=dry_run)
 
 def ensure_github_repository(
     *,
@@ -1306,16 +1450,19 @@ def sync_repositories(
         confirm_remote_retarget=confirm_github_remote_retarget,
         dry_run=dry_run,
     )
-    # 2. Gitee owner 默认取 SSH 登录账号，例如 liangliang2000；仓库名沿用 GitHub 仓库名。
+    # 2. Gitee owner 默认取命令行参数；没有参数时优先 SSH/token 识别，最后回退到 DEFAULT_GITEE_OWNER。
+    token, token_source = gitee_token()
+    if token:
+        log(f"Using Gitee token from {token_source}.")
+
     target = build_gitee_target(
-        choose_gitee_owner(gitee_owner, github_slug.owner),
+        choose_gitee_owner(gitee_owner, github_slug.owner, token),
         github_slug.name,
     )
     log(f"GitHub repository: {github_slug.owner}/{github_slug.name}")
     log(f"Gitee target: {target.owner}/{target.name}")
 
     # 3. 确保 Gitee 仓库存在。默认创建公开仓库；只有传 --private 才创建/允许私有仓库。
-    token = os.environ.get(GITEE_TOKEN_ENV)
     gitee_public_after_push = ensure_gitee_repo(
         target=target,
         token=token,
@@ -1495,8 +1642,9 @@ def print_init_gitee(
         )
 
     print("\nGitee access token:")
-    if os.environ.get(GITEE_TOKEN_ENV):
-        print(f"  {GITEE_TOKEN_ENV} is set")
+    gitee_access_token, gitee_token_source = gitee_token()
+    if gitee_access_token:
+        print(f"  {gitee_token_source} is available")
     else:
         print(f"  {GITEE_TOKEN_ENV} is not set")
         print("  Current PowerShell session:")
@@ -1526,14 +1674,15 @@ def print_init_gitee(
         if slug:
             github_target = build_github_target(slug.owner, slug.name)
             target = build_gitee_target(
-                choose_gitee_owner(gitee_owner, slug.owner),
+                choose_gitee_owner(gitee_owner, slug.owner, gitee_access_token),
                 slug.name,
             )
             print("\nDerived repository mapping:")
             print(f"  GitHub: {github_target.owner}/{github_target.name}")
             print(f"  GitHub remote: {github_target.ssh_url}")
             print(f"  Gitee : {target.owner}/{target.name}")
-            print(f"  Gitee remote : {target.ssh_url}")
+            print(f"  Gitee SSH remote  : {target.ssh_url}")
+            print(f"  Gitee HTTPS remote: {target.https_url}")
     except SyncError as exc:
         print(f"\nRepository mapping skipped: {exc}")
 
@@ -1615,7 +1764,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help=(
             "Gitee user or namespace. Defaults to the detected Gitee SSH "
-            "login, then falls back to the GitHub owner."
+            f"login, then Gitee token, then {DEFAULT_GITEE_OWNER}."
         ),
     )
     parser.add_argument(
